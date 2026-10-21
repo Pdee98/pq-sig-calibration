@@ -1,0 +1,54 @@
+name: Cross-platform calibration
+on:
+  workflow_dispatch:
+    inputs:
+      backends:
+        description: "Comma-separated backend IDs to calibrate, or all"
+        required: false
+        default: "all"
+        type: string
+
+jobs:
+  calibrate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        rep: [1, 2, 3]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+      - uses: actions/cache@v4
+        with:
+          path: |
+            third_party/install
+            third_party/cache
+            third_party/kat
+          key: deps-${{ runner.os }}-${{ runner.arch }}-openssl-3.5.5-liboqs-0.16.0-v1
+      - name: Build pinned dependencies
+        run: bash scripts/build_deps.sh
+      - name: Install Python dependency
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Test
+        run: |
+          source third_party/env.sh
+          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python -m unittest discover -s tests -v
+      - name: Calibrate one independent session
+        run: |
+          source third_party/env.sh
+          arch=$(uname -m)
+          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python scripts/run_calibration.py \
+            --output "outputs/calib-${arch}-rep${{ matrix.rep }}" --session-index $(( ${{ matrix.rep }} - 1 )) \
+            --backends "${{ inputs.backends }}"
+      - name: Upload calibration
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: calib-${{ runner.arch }}-rep${{ matrix.rep }}
+          path: outputs/calib-*-rep${{ matrix.rep }}
+          if-no-files-found: error
