@@ -57,3 +57,20 @@ dependency build and parity measurements bring the expected x86 job to roughly
 2 hours. A conservative 2x--2.25x ARM allowance gives 4--4.5 hours, below the
 350-minute workflow timeout. Runtime is host-dependent and this is not an upper
 bound.
+# Revision R2 probe
+
+The optional narrow probe measures Ed25519 invalid-signature rejection and
+Python/ctypes call overhead without running the full backend calibration:
+
+```bash
+source third_party/env.sh
+python scripts/run_calibration.py --output calibration-output/r2-probe \
+  --backends r2_probe --samples 300
+```
+
+It records 300 single-bit-flip and 300 random-signature Ed25519 rejection
+times in `raw_samples.csv`, plus 10,000 Python no-op method calls and 10,000
+ctypes `OQS_version()` calls in `overhead_probe.csv`. Both use
+`time.perf_counter_ns` and preserve the package's portable timed-region
+convention. The workflow's existing `backends` input accepts `r2_probe`.
+

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import csv
 import gc
 import hashlib
@@ -54,6 +55,62 @@ class _Ed25519:
     def close(self): pass
 
 
+class _NoOpBackend:
+    def noop(self):
+        return None
+
+
+def _liboqs_library_path() -> Path:
+    prefix = os.environ.get("OQS_INSTALL_PATH")
+    candidates = []
+    if prefix:
+        candidates.extend((Path(prefix) / "lib/liboqs.so", Path(prefix) / "lib64/liboqs.so"))
+    candidates.append(Path(__file__).resolve().parents[1] / "third_party/install/lib/liboqs.so")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    raise RuntimeError("The project-local liboqs shared library is unavailable.")
+
+
+def _r2_probe(output: Path, session: int, sample_count: int, overhead_count: int) -> None:
+    rows = []
+    backend = _Ed25519()
+    public_key = backend.keygen()
+    message = _message("ed25519_cryptography", session, 0)
+    signature = backend.sign(message)
+    for index in range(sample_count):
+        flipped = bytearray(signature)
+        flipped[index % len(flipped)] ^= 1
+        rejected, duration = _time_rejection(backend.verify, message, bytes(flipped))
+        rows.append(_row("ed25519_cryptography", session, "verify_invalid", index, duration,
+                         len(signature), len(public_key), rejected, "single_bit_flip"))
+        rejected, duration = _time_rejection(backend.verify, message, os.urandom(len(signature)))
+        rows.append(_row("ed25519_cryptography", session, "verify_invalid", index, duration,
+                         len(signature), len(public_key), rejected, "random_bytes"))
+    backend.close()
+    _append_raw_rows(output / "raw_samples.csv", rows)
+
+    noop = _NoOpBackend()
+    library = ctypes.CDLL(str(_liboqs_library_path()))
+    oqs_version = library.OQS_version
+    oqs_version.argtypes = []
+    oqs_version.restype = ctypes.c_char_p
+    overhead_rows = []
+    for operation, function in (("python_noop_method", noop.noop), ("ctypes_oqs_version", oqs_version)):
+        for index in range(overhead_count):
+            _, duration = _time_call(function)
+            overhead_rows.append({
+                "evidence_label": "REAL-CRYPTO",
+                "operation": operation,
+                "sample_index": index,
+                "duration_ns": duration,
+                "timer": "time.perf_counter_ns",
+                "timed_region": "one Python method call" if operation == "python_noop_method"
+                                else "one ctypes call to OQS_version in the loaded project-local liboqs",
+            })
+    _write_csv(output / "overhead_probe.csv", overhead_rows)
+
+
 def _calibrate_simple(label, factory, session, counts, rows):
     keygen_count, sample_count = counts
     for index in range(keygen_count):
@@ -66,6 +123,14 @@ def _calibrate_simple(label, factory, session, counts, rows):
     for index, (message, signature) in enumerate(signatures):
         accepted, duration = _time_call(backend.verify, message, signature)
         rows.append(_row(label, session, "verify", index, duration, len(signature), len(public_key), accepted))
+        flipped = bytearray(signature)
+        flipped[index % len(flipped)] ^= 1
+        rejected, duration = _time_rejection(backend.verify, message, bytes(flipped))
+        rows.append(_row(label, session, "verify_invalid", index, duration, len(signature),
+                         len(public_key), rejected, "single_bit_flip"))
+        rejected, duration = _time_rejection(backend.verify, message, os.urandom(len(signature)))
+        rows.append(_row(label, session, "verify_invalid", index, duration, len(signature),
+                         len(public_key), rejected, "random_bytes"))
     backend.close()
 
 
@@ -423,7 +488,7 @@ def main():
     parser.add_argument("--samples", type=int, default=300)
     parser.add_argument("--persistence-samples", type=int, default=300)
     parser.add_argument("--session-index", type=int, default=0)
-    parser.add_argument("--backends", default="all", help="Comma-separated backend IDs, or 'all'.")
+    parser.add_argument("--backends", default="all", help="Comma-separated backend IDs, 'all', or 'r2_probe'.")
     parser.add_argument("--quick", action="store_true")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
@@ -431,6 +496,35 @@ def main():
     if args.quick:
         args.keygen, args.samples, args.persistence_samples = 1, 2, 2
     all_labels = [*ED25519, *STATEFUL, *OPENSSL, *FALCON, *PROJECT]
+    if args.backends == "r2_probe":
+        selected = ["r2_probe"]
+        raw_path = args.output / "raw_samples.csv"
+        if raw_path.exists() or (args.output / "progress.json").exists():
+            raise FileExistsError("Calibration output already contains progress or raw samples.")
+        _write_progress(args.output, selected, [], started_at)
+        _r2_probe(args.output, args.session_index, args.samples, 20 if args.quick else 10_000)
+        rows = _read_raw_rows(raw_path)
+        _write_csv(args.output / "calibration_summary.csv", _summary(rows))
+        ended_at = datetime.now(UTC).isoformat()
+        (args.output / "environment.json").write_text(
+            json.dumps(_environment(started_at, ended_at), indent=2) + "\n", encoding="utf-8"
+        )
+        protocol = {
+            "schema_version": "revision-r2-probe-v1",
+            "evidence_label": "REAL-CRYPTO",
+            "backend": "ed25519_cryptography",
+            "invalid_verify_per_variant": args.samples,
+            "invalid_variants": ["single_bit_flip", "random_bytes"],
+            "overhead_samples_per_operation": 20 if args.quick else 10_000,
+            "timer": "time.perf_counter_ns",
+            "quick_mode": args.quick,
+        }
+        (args.output / "calibration_protocol.json").write_text(
+            json.dumps(protocol, indent=2) + "\n", encoding="utf-8"
+        )
+        _write_progress(args.output, selected, ["r2_probe"], started_at, status="complete")
+        _sha_manifest(args.output)
+        return
     selected = all_labels if args.backends == "all" else [item.strip() for item in args.backends.split(",") if item.strip()]
     unknown = sorted(set(selected) - set(all_labels))
     if unknown or not selected:
